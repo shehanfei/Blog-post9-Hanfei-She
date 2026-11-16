@@ -1,0 +1,286 @@
+---
+title: "Can Gradient Boosting Predict Stock Returns? Revisiting the Class Experiment"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", out.width = "92%", dpi = 120)
+library(ggplot2); library(knitr)
+for (f in c("config", "data", "features", "models", "evaluate")) source(file.path("R", paste0(f, ".R")))
+set.seed(SEED)
+dir.create("results/figures", showWarnings = FALSE, recursive = TRUE)
+dir.create("results/tables",  showWarnings = FALSE, recursive = TRUE)
+
+save_fig <- function(p, name, w = 8, h = 4.8) ggsave(file.path("results/figures", name), p, width = w, height = h, dpi = 150)
+fmt <- function(x, d = 2) formatC(x, format = "f", digits = d)
+COLS <- c("Buy and hold" = "grey40", "Original model" = "#d73027", "Improved model" = "#2166ac")
+```
+
+## The question
+
+Can a flexible machine-learning model predict tomorrow's stock return from past prices, and would acting on those predictions make money? In class we ran an experiment that used gradient boosting to predict stock returns. In this post I (1) explain that experiment and what it taught us, (2) explain why stock returns are so hard to predict, (3) try to improve the model in several ways, and (4) test the result honestly on data the model never saw, against both the original model and a simple benchmark, in terms of both **forecast accuracy** and **investment performance**.
+
+The topic matters because it is a clean test of a common belief: that a sophisticated algorithm applied to enough data must find an edge. Finding out whether it does, and how we would know, teaches more than a lucky result would.
+
+## Data and setup
+
+```{r data}
+px  <- load_symbol(TICKER)
+vix <- load_symbol("^VIX")
+tnx <- load_symbol("^TNX")
+ds  <- make_dataset(px, vix, tnx, n_lags = ORIG_LAGS)
+ALL_FEATURES  <- setdiff(names(ds), c("date", "price", "ret", "y"))
+ORIG_FEATURES <- paste0("ret_l", 0:(ORIG_LAGS - 1))
+train <- ds[ds$date <  TEST_START, ]
+test  <- ds[ds$date >= TEST_START, ]
+```
+
+* **Asset:** daily adjusted closing prices of **`r TICKER`** (an exchange-traded fund tracking the S&P 500) from Yahoo Finance, plus the VIX volatility index and the 10-year Treasury yield as market-wide predictors. Adjusted prices include dividends.
+* **Target:** the next day's log return, in percent.
+* **Sample split (the key design choice):** the model is *trained* on `r nrow(train)` trading days from `r format(min(train$date))` to `r format(max(train$date))` and *tested* on `r nrow(test)` later days from `r format(min(test$date))` to `r format(max(test$date))`. The test set is never used to choose anything. Returns are time-ordered, so I never shuffle the data: shuffling would let the model "peek" at the future.
+* **No look-ahead:** every predictor at date *t* is computed from information available at the close of day *t*, and the target is the return over day *t*+1.
+
+## The original experiment
+
+The in-class experiment asked whether a gradient boosting model can forecast the next day's return of a stock from its recent history. In my reproduction, the **original model** uses the last `r ORIG_LAGS` daily returns as predictors and a standard gradient boosting model (xgboost with maximum tree depth `r ORIG_PARAMS$max_depth`, learning rate `r ORIG_PARAMS$eta` and `r ORIG_NROUNDS` boosting rounds), fit once on the training period and then used to predict the test period.
+
+*Gradient boosting* builds a prediction by adding up many small decision trees, each one fitted to the errors of the trees before it. It is flexible, capturing nonlinearities and interactions without being told where to look, and it is a workhorse for tabular data. That flexibility is exactly what makes it dangerous with noisy data.
+
+```{r original}
+bench_all  <- c(NA, cumsum(ds$y)[-nrow(ds)] / seq_len(nrow(ds) - 1))   # expanding historical mean, known at time t
+bench_test <- bench_all[ds$date >= TEST_START]
+
+m_orig  <- fit_xgb(train[, ORIG_FEATURES], train$y, ORIG_PARAMS, ORIG_NROUNDS)
+p_orig  <- predict_xgb(m_orig, test[, ORIG_FEATURES])
+p_orig_in <- predict_xgb(m_orig, train[, ORIG_FEATURES])
+r2_in   <- 1 - sum((train$y - p_orig_in)^2) / sum((train$y - mean(train$y))^2)
+r2_out  <- oos_r2(test$y, p_orig, bench_test)
+```
+
+The headline result of the original experiment is the gap between two numbers. On the training data the model explains **`r fmt(100 * r2_in, 1)`%** of the variation in next-day returns. On the test data its out-of-sample R² (measured against the simple benchmark defined below) is **`r fmt(100 * r2_out, 1)`%**. `r if (r2_out < 0) "A negative out-of-sample R² means the model's forecasts are worse than simply predicting the average past return." else "The out-of-sample R² is positive but, as the rest of the post shows, needs a careful look."` The model has learned patterns in the training period that did not carry over, the textbook symptom of **overfitting**.
+
+### The benchmark
+
+To judge a forecast we need something to beat. The standard benchmark in this literature is the **historical average return**: at each date, predict that tomorrow's return equals the average of all returns seen so far. It uses no predictors at all, so it asks the question "does knowing X help at all?" Out-of-sample R² is defined relative to it: R² = 1 − (squared errors of the model) / (squared errors of the benchmark). Positive means the model adds information; zero means no better than the average; negative means worse. As an investment strategy the benchmark simply stays invested (the historical mean return is positive), which is **buy-and-hold**, my benchmark for the investment tests too.
+
+## Why predicting stock returns is difficult
+
+```{r hard-stats}
+r <- ds$ret[ds$date < TEST_START]
+a1  <- acf(r,   lag.max = 20, plot = FALSE)$acf[-1]
+a2  <- acf(r^2, lag.max = 20, plot = FALSE)$acf[-1]
+acf_df <- rbind(data.frame(lag = 1:20, acf = a1, series = "Returns"),
+                data.frame(lag = 1:20, acf = a2, series = "Squared returns (volatility)"))
+ci <- 1.96 / sqrt(length(r))
+p_acf <- ggplot(acf_df, aes(lag, acf)) +
+  geom_hline(yintercept = c(-ci, ci), linetype = "dashed", color = "grey50") +
+  geom_col(fill = "#2166ac", width = 0.6) +
+  facet_wrap(~series) +
+  labs(x = "Lag (trading days)", y = "Autocorrelation",
+       caption = paste0("Training sample, ", TICKER, ". Dashed lines: approximate 95% band under no autocorrelation.")) +
+  theme_minimal(base_size = 12)
+save_fig(p_acf, "fig1_autocorrelation.png")
+p_acf
+```
+
+*Figure 1. Yesterday's returns say almost nothing about today's (left), but the size of moves is highly predictable (right).*
+
+Figure 1 shows the core problem. In the training sample the typical daily return is `r fmt(mean(r), 3)`% while the typical daily *swing* (standard deviation) is `r fmt(sd(r), 2)`%, about `r fmt(sd(r) / abs(mean(r)), 0)` times larger than the average. The first-day autocorrelation of returns is `r fmt(a1[1], 3)`, tiny compared with the autocorrelation of squared returns (`r fmt(a2[1], 2)`). Volatility is persistent and therefore forecastable; the direction of returns is not. Several reasons explain why:
+
+* **Very low signal-to-noise.** Most daily movement is news that nobody could have anticipated. Even a genuinely useful predictor explains only a sliver of that variance, perhaps a fraction of one percent. A model has to find a tiny signal in huge noise.
+* **Competition erases predictability.** Many well-funded investors search for exactly these patterns. If a simple pattern in past returns reliably predicted future returns, trading on it would push prices until the pattern vanished (the idea behind the efficient-markets hypothesis).
+* **The world changes.** Relationships that held in one decade (a monetary regime, a crisis, a market structure) may not hold in the next. A model trained on `r format(min(train$date), '%Y')` to `r format(max(train$date), '%Y')` is asked to forecast a period that may contain regime shifts it never saw.
+* **Limited effective data, many ways to overfit.** We have a few thousand daily observations, and with dozens of candidate predictors, flexible models and many specifications, something will look good in-sample by chance. Researchers who try many specifications also face a multiple-testing problem: the best-looking one is likely luck.
+* **Costs.** Even a real but small edge can be wiped out by trading costs and market impact.
+
+This frames what to expect. A better model is unlikely to produce a large R². The right questions are whether it is *distinguishable from zero* out of sample, and whether any improvement is *economically meaningful* after costs.
+
+## Improving the model
+
+I tried four changes, adding them one at a time so I can tell which (if any) matters. Each change targets a specific weakness of the original model.
+
+| Model | What changes | Why |
+|---|---|---|
+| **A. Original** | Last 5 returns; deep trees (depth 6), fast learning, 100 rounds; one fit | The class setup |
+| **B. + Features** | Adds momentum (5, 21, 63, 126 days), volatility (5, 21, 63 days), distance from moving averages, RSI, drawdown, volume, VIX and Treasury yield changes | Returns alone carry little information; volatility, trend and market-wide risk may carry more |
+| **C. + Tuned & regularized** | Hyperparameters chosen on a time-ordered validation set: shallow trees, slow learning rate, row/column subsampling, ridge penalty, number of rounds | Counter overfitting: in a noisy problem the best model is a heavily shrunk one |
+| **D. + Walk-forward retraining** | Refit every `r RETRAIN_EVERY` trading days on all data seen so far | Markets change; the model should adapt as new data arrive, without ever using future data |
+
+```{r tuning}
+tuned <- tune_xgb(train, ALL_FEATURES)
+write.csv(tuned$table, "results/tables/tuning_grid.csv", row.names = FALSE)
+```
+
+For model C, the tuning step searched `r nrow(TUNE_GRID)` combinations of tree depth and learning rate and up to `r TUNE_MAX_ROUNDS` boosting rounds, using only the last 20% of the *training* period as validation (the test period was never touched). The chosen setting is trees of depth **`r tuned$best$max_depth`**, learning rate **`r tuned$best$eta`**, and **`r tuned$best$nrounds`** rounds. For reference, the validation error of simply predicting the mean was `r fmt(tuned$val_mse_mean, 4)`, versus `r fmt(tuned$best$val_mse, 4)` for the chosen model. `r if (tuned$best$val_mse < tuned$val_mse_mean) "The tuned model is slightly better than the mean on the validation data, but by a very small margin." else "Even the best tuned model is no better than predicting the mean on the validation data, a first hint of how little signal there is."`
+
+```{r fit-models}
+m_B <- fit_xgb(train[, ALL_FEATURES], train$y, ORIG_PARAMS, ORIG_NROUNDS)
+m_C <- fit_xgb(train[, ALL_FEATURES], train$y, tuned$params, tuned$nrounds)
+p_B <- predict_xgb(m_B, test[, ALL_FEATURES])
+p_C <- predict_xgb(m_C, test[, ALL_FEATURES])
+p_D <- walk_forward(ds, ALL_FEATURES, tuned$params, tuned$nrounds, TEST_START, RETRAIN_EVERY)
+
+preds <- data.frame(date = test$date, y = test$y, bench = bench_test,
+                    A = p_orig, B = p_B, C = p_C, D = p_D)
+write.csv(preds, "results/tables/test_predictions.csv", row.names = FALSE)
+```
+
+## Out-of-sample forecast performance
+
+```{r forecast-table}
+labs <- c(A = "A. Original", B = "B. + Features", C = "C. + Tuned & regularized", D = "D. + Walk-forward (Improved)")
+fm <- do.call(rbind, lapply(names(labs), function(k) cbind(Model = labs[[k]], forecast_metrics(preds$y, preds[[k]], preds$bench))))
+fm <- rbind(data.frame(Model = "Benchmark: historical mean", OOS_R2_pct = 0,
+                       RMSE = sqrt(mean((preds$y - preds$bench)^2)),
+                       Hit_rate_pct = 100 * mean(preds$y > 0), DM_t = NA_real_, DM_p = NA_real_), fm)
+write.csv(fm, "results/tables/forecast_performance.csv", row.names = FALSE)
+kable(fm, digits = c(0, 2, 4, 1, 2, 3), row.names = FALSE,
+      col.names = c("Model", "OOS R² (%)", "RMSE (% points)", "Hit rate (%)", "DM t-stat", "p-value (one-sided)"),
+      caption = paste0("Table 1. Out-of-sample forecasts of next-day ", TICKER, " returns, ", nrow(test), " test days. OOS R² is relative to the historical-mean benchmark."))
+```
+
+*How to read Table 1.* **OOS R²** is the share of the benchmark's squared forecast error the model removes (negative = worse than the benchmark). **Hit rate** is how often the sign of the forecast matches the sign of the actual return; the benchmark's hit rate is the share of up days in the test period (`r fmt(100 * mean(preds$y > 0), 1)`%), since it always predicts "up". The **DM t-statistic** (Diebold-Mariano style, with Newey-West standard errors) tests whether the model's squared errors are smaller than the benchmark's; large positive values (above about 1.65) would be evidence of real skill.
+
+```{r forecast-text, echo=FALSE}
+R2 <- setNames(fm$OOS_R2_pct[-1], c("A", "B", "C", "D"))
+DMp <- setNames(fm$DM_p[-1], c("A", "B", "C", "D"))
+best <- names(R2)[which.max(R2)]
+```
+
+The original model's out-of-sample R² is **`r fmt(R2["A"])`%**. Adding features (B) gives `r fmt(R2["B"])`%, adding tuning and regularization (C) gives `r fmt(R2["C"])`%, and adding walk-forward retraining (D, the full improved model) gives **`r fmt(R2["D"])`%**. The best of the four on this measure is model `r best`. `r if (R2["D"] > R2["A"]) "So the improvements did help relative to the original model, mostly by making it less overconfident" else "So the extra sophistication did not help relative to the original model"`. `r if (R2["D"] <= 0) "But the improved model is still not better than predicting the historical average, so it has not found real predictability in this test period." else if (DMp["D"] < 0.05) "The improved model beats the benchmark by a statistically detectable amount, although the margin in R² terms is small." else paste0("The improved model's R² is positive, but the one-sided p-value of ", fmt(DMp["D"], 3), " says the improvement is statistically indistinguishable from luck.")`
+
+```{r sse-plot, fig.cap="Figure 2. Cumulative squared-error advantage over the benchmark. A rising line means the model is beating the historical mean; a falling line means it is losing. A line that jumps in one episode and is flat otherwise suggests the result comes from a single event."}
+cs <- rbind(
+  data.frame(date = preds$date, adv = cumsum((preds$y - preds$bench)^2 - (preds$y - preds$A)^2), Model = "Original model"),
+  data.frame(date = preds$date, adv = cumsum((preds$y - preds$bench)^2 - (preds$y - preds$D)^2), Model = "Improved model"))
+p_sse <- ggplot(cs, aes(date, adv, color = Model)) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.3) +
+  geom_line(linewidth = 0.9) +
+  scale_color_manual(values = COLS) +
+  labs(x = NULL, y = "Cumulative squared-error advantage over benchmark") +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom", legend.title = element_blank())
+save_fig(p_sse, "fig2_cumulative_error_advantage.png")
+p_sse
+```
+
+Figure 2 shows *when* the models gain or lose. The original model's line `r if (tail(cs$adv[cs$Model == "Original model"], 1) < 0) "ends below zero: it loses ground to the benchmark" else "ends above zero"`, and the improved model's line `r if (tail(cs$adv[cs$Model == "Improved model"], 1) < 0) "ends below zero" else "ends above zero"`. The shape of the line matters as much as its endpoint: large swings in a few days (the 2020 crash, for instance) mean the result depends on a few events rather than on steady skill.
+
+```{r quintiles, fig.cap="Figure 3. Average next-day return in each quintile of the model's prediction (1 = lowest predicted return, 5 = highest). If the model ranks days well, the bars should rise from left to right. Error bars are ±2 standard errors."}
+qa <- cbind(quintile_table(preds$y, preds$A), Model = "Original model")
+qd <- cbind(quintile_table(preds$y, preds$D), Model = "Improved model")
+q <- rbind(qa, qd)
+write.csv(q, "results/tables/quintile_returns.csv", row.names = FALSE)
+p_q <- ggplot(q, aes(factor(quintile), mean_ret, fill = Model)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = mean_ret - 2 * se, ymax = mean_ret + 2 * se), position = position_dodge(0.8), width = 0.25) +
+  geom_hline(yintercept = 0) +
+  scale_fill_manual(values = COLS) +
+  labs(x = "Quintile of predicted return", y = "Average realized next-day return (%)") +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom", legend.title = element_blank())
+save_fig(p_q, "fig3_quintiles.png")
+p_q
+```
+
+Figure 3 asks a more forgiving question than R²: even if the *levels* of the forecasts are off, does the model at least *rank* days correctly? For the improved model the top quintile earned `r fmt(qd$mean_ret[5], 3)`% on average versus `r fmt(qd$mean_ret[1], 3)`% for the bottom quintile, a spread of `r fmt(qd$mean_ret[5] - qd$mean_ret[1], 3)` percentage points per day, compared with a standard error of about `r fmt(mean(qd$se), 3)` for each bar. For the original model the spread is `r fmt(qa$mean_ret[5] - qa$mean_ret[1], 3)`. A spread that is small relative to the error bars is indistinguishable from zero.
+
+```{r importance, fig.cap="Figure 4. What the tuned model (C) relies on most (gain importance, share of total). Importance shows what the model uses, not that the use is profitable."}
+imp <- as.data.frame(xgboost::xgb.importance(model = m_C))
+imp <- head(imp[order(-imp$Gain), ], 10)
+p_imp <- ggplot(imp, aes(reorder(Feature, Gain), Gain)) +
+  geom_col(fill = "#2166ac") + coord_flip() +
+  labs(x = NULL, y = "Gain (share of total)") + theme_minimal(base_size = 12)
+save_fig(p_imp, "fig4_feature_importance.png", h = 4.2)
+p_imp
+```
+
+Figure 4 shows that the tuned model leans on `r paste(head(rev(levels(reorder(imp$Feature, imp$Gain))), 3), collapse = ", ")`. These are mostly the volatility, trend and market-risk measures rather than the raw lagged returns the original model used, consistent with the earlier finding that volatility is predictable and direction is not. But a model can rely heavily on a variable that does not help it forecast *returns* out of sample.
+
+## Would the predictions have made money?
+
+Forecast accuracy and investment value are different things. A tiny R² can still be valuable if it helps time large moves, and a decent hit rate can be worthless if the wins are small and the losses large. To test economic value I turn each forecast into a trading rule:
+
+* **Rule:** at the close of each day, hold the asset on the next day if the model predicts a positive return, and hold cash (zero return) otherwise.
+* **Costs:** `r COST_BPS` basis points (`r fmt(COST_BPS / 100, 2)`%) are charged each time the position changes.
+* **Benchmark:** buy-and-hold, the strategy implied by the historical-mean forecast. Cash earns zero for simplicity, which slightly flatters strategies that sit in cash.
+* **Statistics:** annualized return and volatility, the Sharpe ratio (annualized mean return divided by volatility, per unit of risk), maximum drawdown (worst peak-to-trough loss), and the number of position switches per year.
+
+```{r strategies}
+r_next <- exp(preds$y / 100) - 1                         # next-day simple return
+w <- list("Buy and hold" = rep(1, nrow(preds)),
+          "Original model" = as.numeric(preds$A > 0),
+          "Improved model" = as.numeric(preds$D > 0))
+rets <- lapply(w, strategy_returns, r_simple = r_next)
+perf <- do.call(rbind, lapply(names(w), function(k) cbind(Strategy = k, perf_stats(rets[[k]], w[[k]]))))
+write.csv(perf, "results/tables/investment_performance.csv", row.names = FALSE)
+kable(perf, digits = c(0, 1, 1, 2, 1, 2, 1), row.names = FALSE,
+      col.names = c("Strategy", "Return (%/yr)", "Volatility (%/yr)", "Sharpe", "Max drawdown (%)", "Final wealth ($1 start)", "Switches per year"),
+      caption = paste0("Table 2. Investment performance over the test period (", format(min(test$date)), " to ", format(max(test$date)), "), after ", COST_BPS, " bps transaction costs."))
+```
+
+```{r wealth-plot, fig.cap="Figure 5. Growth of $1 invested at the start of the test period (log scale), after transaction costs."}
+wealth <- do.call(rbind, lapply(names(rets), function(k)
+  data.frame(date = preds$date, wealth = cumprod(1 + rets[[k]]), Strategy = k)))
+p_w <- ggplot(wealth, aes(date, wealth, color = Strategy)) +
+  geom_line(linewidth = 0.9) + scale_y_log10() +
+  scale_color_manual(values = COLS) +
+  labs(x = NULL, y = "Value of $1 (log scale)") +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom", legend.title = element_blank())
+save_fig(p_w, "fig5_wealth.png")
+p_w
+```
+
+```{r sharpe-boot}
+set.seed(SEED)
+bd <- boot_sharpe_diff(rets[["Improved model"]], rets[["Buy and hold"]], B = 2000, block = 20)
+bd_ci <- quantile(bd, c(0.025, 0.975))
+sh_diff <- sharpe(rets[["Improved model"]]) - sharpe(rets[["Buy and hold"]])
+```
+
+Over the test period buy-and-hold earned **`r fmt(perf$Ann_return_pct[1], 1)`%** per year with a Sharpe ratio of **`r fmt(perf$Sharpe[1])`**. The original model's rule earned `r fmt(perf$Ann_return_pct[2], 1)`% (Sharpe `r fmt(perf$Sharpe[2])`) and the improved model's rule `r fmt(perf$Ann_return_pct[3], 1)`% (Sharpe `r fmt(perf$Sharpe[3])`). The improved model switched position about `r fmt(perf$Switches_per_year[3], 0)` times a year, versus `r fmt(perf$Switches_per_year[2], 0)` for the original.
+
+Is the improved strategy's Sharpe ratio really different from buy-and-hold? Sharpe ratios estimated from a few years of daily data are very noisy. A moving-block bootstrap (resampling 20-day blocks of returns, as in the bootstrap post, to preserve volatility clustering) gives a 95% interval for the Sharpe-ratio difference (improved minus buy-and-hold) of **[`r fmt(bd_ci[1])`, `r fmt(bd_ci[2])`]**, around a point estimate of `r fmt(sh_diff)`. `r if (bd_ci[1] > 0) "The interval lies entirely above zero, which would be evidence of a real improvement." else if (bd_ci[2] < 0) "The interval lies entirely below zero: the strategy is detectably worse than buy-and-hold." else "The interval contains zero, so we cannot distinguish the strategy from buy-and-hold."`
+
+```{r costs}
+cost_grid <- c(0, 5, 10, 25)
+ct <- do.call(rbind, lapply(cost_grid, function(cb) {
+  data.frame(Cost_bps = cb,
+             Original = sharpe(strategy_returns(w[["Original model"]], r_next, cb)),
+             Improved = sharpe(strategy_returns(w[["Improved model"]], r_next, cb)),
+             Buy_and_hold = sharpe(r_next))
+}))
+write.csv(ct, "results/tables/sharpe_by_cost.csv", row.names = FALSE)
+kable(ct, digits = 2, col.names = c("Cost (bps per position change)", "Original model Sharpe", "Improved model Sharpe", "Buy-and-hold Sharpe"),
+      caption = "Table 3. Sharpe ratios under different transaction-cost assumptions.")
+```
+
+Table 3 shows how sensitive the conclusion is to trading costs. `r if (ct$Improved[1] > ct$Buy_and_hold[1] && ct$Improved[4] < ct$Buy_and_hold[4]) "The improved rule beats buy-and-hold only when costs are low; at higher costs the advantage disappears." else if (ct$Improved[1] <= ct$Buy_and_hold[1]) "The improved rule does not beat buy-and-hold even with zero costs, so costs are not what is holding it back." else "The improved rule's advantage over buy-and-hold persists across the cost assumptions tried here."` Costs matter more for strategies that switch often, and frequent switching is typical of strategies built on noisy daily forecasts.
+
+## Takeaway
+
+```{r takeaway-vals, echo=FALSE}
+skill <- (R2["D"] > 0 && DMp["D"] < 0.05)
+econ  <- (bd_ci[1] > 0)
+```
+
+* **The original experiment shows overfitting, not prediction.** The original gradient boosting model explained `r fmt(100 * r2_in, 1)`% of returns in-sample and `r fmt(R2["A"], 1)`% out of sample (relative to the historical mean).
+* **The improvements were substantive, and they mattered.** Richer features, strong regularization and walk-forward retraining moved out-of-sample R² from `r fmt(R2["A"], 2)`% to `r fmt(R2["D"], 2)`%. `r if (skill) "The improved model beats the historical-mean benchmark by a statistically detectable margin, but the margin is small." else "Even so, the improved model does not clearly beat a forecast that uses no predictors at all."`
+* **Economic value:** `r if (econ) "The improved strategy's Sharpe ratio exceeds buy-and-hold's in the bootstrap interval, but the result should be treated with caution: one test period, one asset, and many modelling choices made along the way." else "After transaction costs, the improved strategy is not distinguishably better than buy-and-hold, so there is no evidence of an economically meaningful edge."`
+* **The lesson:** `r if (skill || econ) "Where an edge appears, it is small and fragile." else "A more sophisticated model still fails to deliver reliable prediction here, which is itself the main finding."` The sophistication that helps most is the kind that *restrains* a model (shrinkage, validation, honest out-of-sample testing), not the kind that adds flexibility.
+
+**Limitations.** (1) One asset, one test period (`r format(min(test$date), "%Y")` onward) and one split; results could differ for individual stocks, other periods or other horizons. (2) My modelling choices (feature list, tuning grid, the long/cash rule) are a few of many I could have tried; the more variants one tries, the more likely one looks good by chance, so I report all the variants I did try. (3) The in-class experiment is reproduced from its description and configured in `R/config.R`; settings may differ from the original. (4) The forecast tests treat losses as independent after adjusting for autocorrelation, an approximation. (5) Cash earns zero and I ignore taxes, market impact and borrowing costs. (6) Ideas I did not test: predicting multi-day or monthly returns (where predictors can matter more), predicting volatility instead of direction, or a cross-section of many stocks, which gives far more data.
+
+## Reproducibility
+
+Settings are in `R/config.R`, functions in `R/`, all figures in `results/figures/` and all tables in `results/tables/`. Data are downloaded once and cached in `data/raw/`. The random seed is fixed.
+
+```{r session}
+sessionInfo()
+```
